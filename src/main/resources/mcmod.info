@@ -1,0 +1,8 @@
+[{
+  "modid": "framemotionblur",
+  "name": "Frame Blending Motion Blur",
+  "description": "Motion blur using frame blending (exponential moving average). Works with OptiFine.",
+  "version": "${version}",
+  "mcversion": "${mcversion}",
+  "authorList": ["you"]
+}]
