@@ -16,10 +16,11 @@ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.InputEvent;
 import org.lwjgl.input.Keyboard;
 
-@Mod(modid = FrameMotionBlur.MODID, name = "Frame Blending Motion Blur", version = "1.0.0",
+@Mod(modid = FrameMotionBlur.MODID, name = "Frame Blending Motion Blur", version = "1.1.1",
         acceptedMinecraftVersions = "[1.8.9]", clientSideOnly = true)
 public class FrameMotionBlur {
     public static final String MODID = "framemotionblur";
+    public static final String VERSION = "1.1.1";
 
     /** 0..100. 0 = off-ish, 100 = very strong ghosting. */
     public static volatile int strength = 50;
@@ -63,7 +64,12 @@ public class FrameMotionBlur {
 
         @Override
         public void processCommand(ICommandSender sender, String[] args) throws CommandException {
-            if (args.length != 1) { say("Usage: " + getCommandUsage(sender)); return; }
+            if (args.length != 1) {
+                say("v" + VERSION + " | " + (enabled ? "ON" : "OFF") + " | strength " + strength
+                        + " | window " + String.format("%.1f", strength / 3.0) + " ms");
+                say("Usage: " + getCommandUsage(sender));
+                return;
+            }
             String a = args[0].toLowerCase();
             if (a.equals("on")) { enabled = true; say("ON"); }
             else if (a.equals("off")) { enabled = false; say("OFF"); }
