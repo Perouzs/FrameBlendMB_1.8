@@ -13,31 +13,56 @@ import org.lwjgl.opengl.GL14;
 /**
  * True frame blending (box filter over a time window), no exponential tail.
  *
- * Output frame = time-weighted mean of all REAL frames rendered in the last `window` ms.
+ * Displayed frame = time-weighted mean of all REAL frames rendered in the last `window` ms.
  *
- * To avoid storing one FBO per frame (1000 FPS * 16 ms = 16 frames), the window is split into
- * BUCKETS time slices. Each bucket holds the exact running mean of the frames that fell into it
- * (dt-weighted). The displayed frame = time-weighted mean of the live buckets. Old buckets are
- * discarded as soon as they leave the window, so nothing older than the window can ever show.
+ * The window is split into N buckets, where N adapts to the current FPS so that each bucket
+ * holds about ONE real frame (N = window / avgFrameTime, clamped to 2..MAX_N).
+ *   255 FPS, window 16.7 ms -> N ~ 4  (1 frame per bucket)
+ *   960 FPS, window 16.7 ms -> N = 8  (~2 frames per bucket)
+ * Each bucket stores the exact dt-weighted mean of the frames inside it.
  *
- * Every blend step uses alpha >= ~1/BUCKETS-ish values (never tiny), which also avoids the
- * 8-bit rounding "stuck pixels" that a small-alpha moving average suffers at very high FPS.
+ * Compose: walking from the newest bucket backwards, each bucket gets weight min(its time, time
+ * still missing from the window). So the OLDEST bucket is cut partially and the window length is
+ * exactly `window` at all times (no flicker from whole buckets entering/leaving).
  */
 public final class BlurRenderer {
-    private static final int BUCKETS = 4;
+    private static final int MAX_N = 8;
+    private static final int RING = MAX_N + 1; // +1 so a partially covered oldest bucket still exists
 
-    private static final Framebuffer[] fb = new Framebuffer[BUCKETS];
-    private static final double[] time = new double[BUCKETS]; // ms of real time in each bucket, 0 = empty
+    private static final Framebuffer[] fb = new Framebuffer[RING]; // allocated lazily
+    private static final double[] time = new double[RING];   // ms of real time stored in bucket, 0 = empty
+    private static final double[] weight = new double[RING]; // ms of that bucket inside the window
     private static int cur = 0;
     private static long lastNanos = 0;
+    private static double avgDt = 0;
     private static int bw = -1, bh = -1;
+
+    /** For /motionblur info. */
+    public static volatile int debugBuckets = 0;
+    public static volatile double debugAvgFps = 0;
 
     private BlurRenderer() {}
 
     private static void reset() {
-        for (int i = 0; i < BUCKETS; i++) time[i] = 0;
+        for (int i = 0; i < RING; i++) { time[i] = 0; weight[i] = 0; }
         cur = 0;
         lastNanos = 0;
+        avgDt = 0;
+    }
+
+    private static void freeBuffers() {
+        for (int i = 0; i < RING; i++) {
+            if (fb[i] != null) { fb[i].deleteFramebuffer(); fb[i] = null; }
+        }
+    }
+
+    private static Framebuffer ensure(int i, int w, int h) {
+        if (fb[i] == null) {
+            fb[i] = new Framebuffer(w, h, false);
+            fb[i].setFramebufferFilter(GL11.GL_LINEAR);
+            fb[i].setFramebufferColor(0f, 0f, 0f, 1f);
+        }
+        return fb[i];
     }
 
     public static void render(boolean enabled, int strength) {
@@ -49,13 +74,8 @@ public final class BlurRenderer {
 
         Framebuffer main = mc.getFramebuffer();
         int w = main.framebufferWidth, h = main.framebufferHeight;
-        if (fb[0] == null || w != bw || h != bh) {
-            for (int i = 0; i < BUCKETS; i++) {
-                if (fb[i] != null) fb[i].deleteFramebuffer();
-                fb[i] = new Framebuffer(w, h, false);
-                fb[i].setFramebufferFilter(GL11.GL_LINEAR);
-                fb[i].setFramebufferColor(0f, 0f, 0f, 1f);
-            }
+        if (w != bw || h != bh) {
+            freeBuffers();
             bw = w; bh = h;
             reset();
         }
@@ -64,50 +84,63 @@ public final class BlurRenderer {
         double dt = (lastNanos == 0) ? 1.0 : Math.min(100.0, (now - lastNanos) / 1.0e6);
         lastNanos = now;
         if (dt < 0.001) dt = 0.001;
+        avgDt = (avgDt <= 0) ? dt : avgDt + 0.1 * (dt - avgDt);
 
         // strength 50 -> 16.7 ms window (= one 60 Hz frame, 360-degree shutter), 100 -> 33 ms
         double window = strength / 3.0;
-        double slice = window / BUCKETS;
 
-        // 1) start a new bucket when the current one is full
-        if (time[cur] >= slice) {
-            cur = (cur + 1) % BUCKETS;
+        // adaptive bucket count: ~1 real frame per bucket, capped for GPU cost
+        int n = (int) Math.round(window / avgDt);
+        n = Math.max(2, Math.min(MAX_N, n));
+        double slice = window / n;
+        debugBuckets = n;
+        debugAvgFps = 1000.0 / avgDt;
+
+        // 1) move to a new bucket when adding this frame would make the current one overshoot
+        //    (add the frame if that brings the bucket closer to `slice`, else rotate)
+        if (time[cur] > 0 && time[cur] + 0.5 * dt >= slice) {
+            cur = (cur + 1) % RING;
             time[cur] = 0;
-        }
-
-        // 2) drop buckets that are completely outside the window (oldest first)
-        double total = dt;
-        for (int i = 0; i < BUCKETS; i++) total += time[i];
-        for (int k = 1; k < BUCKETS; k++) {
-            int idx = (cur + k) % BUCKETS; // k=1 is the oldest
-            if (time[idx] > 0 && total - time[idx] >= window) {
-                total -= time[idx];
-                time[idx] = 0;
-            }
         }
 
         setupState();
 
-        // 3) add the real frame to the current bucket (exact dt-weighted running mean)
+        // 2) add the real frame into the current bucket (exact dt-weighted running mean)
+        Framebuffer curFb = ensure(cur, w, h);
         float a = (time[cur] <= 0) ? 1f : (float) (dt / (time[cur] + dt));
-        draw(main, fb[cur], a);
+        draw(main, curFb, a);
         time[cur] += dt;
 
-        // 4) compose displayed frame = time-weighted mean of live buckets, oldest -> newest
-        int live = 0;
-        for (int i = 0; i < BUCKETS; i++) if (time[i] > 0) live++;
-        if (live > 1) {
+        // 3) per-bucket weights, newest -> oldest; the oldest used bucket is cut partially
+        double remaining = window;
+        for (int k = 0; k < RING; k++) {
+            int idx = (cur - k + RING) % RING;
+            if (time[idx] <= 0) { weight[idx] = 0; continue; }
+            if (remaining <= 0) { time[idx] = 0; weight[idx] = 0; continue; } // fully outside: free it
+            double wgt = Math.min(time[idx], remaining);
+            weight[idx] = wgt;
+            remaining -= wgt;
+        }
+
+        // 4) compose displayed frame, oldest -> newest
+        int count = 0;
+        for (int i = 0; i < RING; i++) {
+            if (weight[i] > 0 && (i == cur || weight[i] >= window * 0.01)) count++;
+        }
+        boolean onlyThisFrame = (count == 1 && time[cur] <= dt + 1e-9);
+        if (count > 0 && !onlyThisFrame) {
             double cum = 0;
             boolean first = true;
-            for (int k = 1; k <= BUCKETS; k++) {
-                int idx = (cur + k) % BUCKETS; // ends with cur (newest)
-                if (time[idx] <= 0) continue;
-                cum += time[idx];
-                draw(fb[idx], main, first ? 1f : (float) (time[idx] / cum));
+            for (int k = RING - 1; k >= 0; k--) {
+                int idx = (cur - k + RING) % RING;
+                double wgt = weight[idx];
+                if (wgt <= 0 || (idx != cur && wgt < window * 0.01)) continue;
+                cum += wgt;
+                draw(fb[idx], main, first ? 1f : (float) (wgt / cum));
                 first = false;
             }
         }
-        // live == 1: the displayed frame is the real frame already in main, nothing to do
+        // onlyThisFrame: the displayed frame is the real frame already in main, nothing to do
 
         main.bindFramebuffer(true);
         restoreState();
