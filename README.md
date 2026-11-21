@@ -1,4 +1,4 @@
-# Frame Blending Motion Blur (Forge 1.8.9, OptiFine-friendly)
+# Frame Blending Motion Blur (Forge 1.8.9)
 
 ## Dùng trong game
 - "/motionblur <0-100>": độ mạnh (mặc định 50); "/motionblur on|off"
